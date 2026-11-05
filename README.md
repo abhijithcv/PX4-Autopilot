@@ -112,11 +112,17 @@ gets PX4's AI review with Sonnet at medium effort. The repository variables
 `AGAM_AUTO_REVIEW_EFFORT` change that.
 
 **Credentials:** reviews run on a Claude subscription token, so they count
-against that subscription's usage limits. To renew or replace it, run
-`claude setup-token` in a terminal and store the token in the `ai-review`
-environment: `gh secret set CLAUDE_CODE_OAUTH_TOKEN --env ai-review`. An
-`ANTHROPIC_API_KEY` in the same environment works too and is used when no
-token is set.
+against that subscription's usage limits. When reviews fail with a 401, the
+token has expired. Run `claude setup-token` in a terminal, then run this
+(zsh). Copy the token only once it is waiting, then press Enter:
+
+```sh
+read -r "?Copy the sk-ant-oat token now, then press Enter: " && t=$(pbpaste | tr -d '[:space:]') && [[ $t == sk-ant-oat* ]] && printf '%s' "$t" | gh secret set CLAUDE_CODE_OAUTH_TOKEN --env ai-review -R agam-robotics/PX4-Autopilot && echo stored || echo "clipboard does not hold a token"
+```
+
+Pasting the token at a prompt cuts it at the first line break, and a long
+token copied from a terminal often contains one. An `ANTHROPIC_API_KEY` in the
+same environment works too and is used when no token is set.
 
 **Changing who can push:** edit the `px4-maintainers` team. It is the rulesets'
 only bypass, and its `maintain` role gates `!ai-review`.
