@@ -1,0 +1,242 @@
+name: Agam PR checks
+
+# Reviews every PR into this fork whose head branch is named pr-*, on open
+# and on every push. That is all the prefix means; who may push or merge is
+# set by the rulesets (role only, see .github/agam/settings).
+#
+#   lint       hygiene, commit messages, Agam board IDs (.github/agam/pr_checks.py)
+#   px4-gate   the gate checks of PX4's checks.yml (check_format and others)
+#   build      the boards the PR touches, else SITL and fmu-v6x for source changes
+#   ai-review  PX4's AI review at medium effort, the same as `!ai-review effort=medium`
+#
+# Runs only when the person who opened or pushed has write access or more,
+# so PRs from strangers' forks spend nothing. pull_request_target always
+# runs this file from the default branch (agam-ci), so a PR cannot change
+# its own checks. PX4's tooling comes from main, which only maintainers can
+# update. Only px4-gate and build execute PR code; they get a read-only
+# token and no secrets.
+#
+# Repository variables (Settings > Secrets and variables > Variables):
+#   AGAM_AUTO_REVIEW         off to skip the automatic AI review
+#   AGAM_AUTO_REVIEW_MODEL   default: PX4's default model (Opus)
+#   AGAM_AUTO_REVIEW_EFFORT  default: medium
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agam-pr-checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  PR_NUMBER: ${{ github.event.pull_request.number }}
+  PR_REF: refs/pull/${{ github.event.pull_request.number }}/head
+  BASE_REF: ${{ github.event.pull_request.base.ref }}
+
+jobs:
+  plan:
+    name: Plan
+    if: startsWith(github.event.pull_request.head.ref, 'pr-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      allowed: ${{ steps.who.outputs.allowed }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_builds: ${{ steps.plan.outputs.has_builds }}
+      build_image: ${{ steps.plan.outputs.build_image }}
+      checks_image: ${{ steps.plan.outputs.checks_image }}
+    steps:
+      - name: Who triggered it
+        id: who
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOGIN: ${{ github.actor }}
+        run: |
+          role=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${LOGIN}/permission" \
+                 --jq .role_name 2>/dev/null || echo none)
+          echo "${LOGIN} has the ${role} role"
+          case "$role" in
+            admin|maintain|write) echo "allowed=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::notice::Not checked: ${LOGIN} has no write access to this repository." ;;
+          esac
+
+      - name: Checkout Agam CI
+        if: steps.who.outputs.allowed == 'true'
+        uses: actions/checkout@v6
+        with:
+          path: ci
+          persist-credentials: false
+          sparse-checkout: .github/agam
+
+      - name: Checkout PX4 CI config from main
+        if: steps.who.outputs.allowed == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            Tools/ci/build_all_config.yml
+            .github/workflows/checks.yml
+          sparse-checkout-cone-mode: false
+
+      - name: Fetch the PR (read with git only)
+        if: steps.who.outputs.allowed == 'true'
+        run: ci/.github/agam/fetch_pr.sh pr "$BASE_REF" "$PR_NUMBER"
+
+      - name: Plan
+        id: plan
+        if: steps.who.outputs.allowed == 'true'
+        run: |
+          python3 ci/.github/agam/pr_checks.py plan --repo pr --head refs/pr/head \
+            --base-ref "$BASE_REF" --px4-root base | tee -a "$GITHUB_OUTPUT"
+
+  lint:
+    name: Hygiene and board IDs
+    needs: plan
+    if: needs.plan.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write         # the sticky report comment
+      pull-requests: write
+    steps:
+      - name: Checkout Agam CI
+        uses: actions/checkout@v6
+        with:
+          path: ci
+          persist-credentials: false
+          sparse-checkout: .github/agam
+
+      - name: Checkout PX4 CI tooling from main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: base
+          persist-credentials: false
+          sparse-checkout: Tools/ci
+
+      - name: Fetch the PR (read with git only)
+        run: ci/.github/agam/fetch_pr.sh pr "$BASE_REF" "$PR_NUMBER"
+
+      - name: Check
+        id: check
+        env:
+          AGAM_VENDOR_DENYLIST: ${{ secrets.AGAM_VENDOR_DENYLIST }}
+        run: |
+          python3 ci/.github/agam/pr_checks.py lint --repo pr --head refs/pr/head \
+            --base-ref "$BASE_REF" --px4-ci base/Tools/ci \
+            --report report.md --status-file status.txt || true
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "status=$(cat status.txt)" >> "$GITHUB_OUTPUT"
+
+      # One comment, updated in place. A clean PR has none, unless it touches
+      # an Agam board: the IDs are then listed for the reviewer.
+      - name: Comment on the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATUS: ${{ steps.check.outputs.status }}
+        run: |
+          if [ "$STATUS" = pass ] && ! grep -q '^### Agam board identity' report.md; then
+            python3 base/Tools/ci/pr_comment.py --marker agam-pr-checks --pr "$PR_NUMBER" --result pass
+          else
+            result=$([ "$STATUS" = fail ] && echo fail || echo warn)
+            python3 base/Tools/ci/pr_comment.py --marker agam-pr-checks --pr "$PR_NUMBER" \
+              --result "$result" < report.md
+          fi
+
+      - name: Result
+        if: steps.check.outputs.status == 'fail'
+        run: |
+          echo "::error::Some checks failed; see the PR comment for how to fix them."
+          exit 1
+
+  px4-gate:
+    name: PX4 gate [${{ matrix.check }}]
+    needs: plan
+    if: needs.plan.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: ${{ needs.plan.outputs.checks_image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # the gate_checks list in PX4's checks.yml
+        check: [check_format, check_newlines, validate_module_configs, shellcheck_all, module_documentation]
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+
+      - name: Configure Git safe directory
+        run: git config --system --add safe.directory '*'
+
+      - name: make ${{ matrix.check }}
+        env:
+          PX4_SBOM_DISABLE: 1
+          CHECK: ${{ matrix.check }}
+        run: make "$CHECK"
+
+  build:
+    name: Build [${{ matrix.target }}]
+    needs: plan
+    if: needs.plan.outputs.allowed == 'true' && needs.plan.outputs.has_builds == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: ${{ needs.plan.outputs.build_image }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Checkout Agam CI
+        uses: actions/checkout@v6
+        with:
+          path: ci
+          persist-credentials: false
+          sparse-checkout: .github/agam
+
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          path: px4
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+
+      - name: Configure Git safe directory
+        run: git config --system --add safe.directory '*'
+
+      - name: make ${{ matrix.target }}
+        working-directory: px4
+        env:
+          PX4_SBOM_DISABLE: 1
+          TARGET: ${{ matrix.target }}
+        run: make "$TARGET"
+
+      - name: Board ID in the built firmware
+        if: matrix.board != ''
+        env:
+          TARGET: ${{ matrix.target }}
+          BOARD: ${{ matrix.board }}
+        run: python3 ci/.github/agam/pr_checks.py artifact --repo px4 --target "$TARGET" --board "$BOARD"
+
+  ai-review:
+    name: AI review
+    needs: plan
+    if: needs.plan.outputs.allowed == 'true' && vars.AGAM_AUTO_REVIEW != 'off'
+    uses: ./.github/workflows/agam-ai-review-run.yml
+    with:
+      pr: ${{ github.event.pull_request.number }}
+      model: ${{ vars.AGAM_AUTO_REVIEW_MODEL || 'default' }}
+      effort: ${{ vars.AGAM_AUTO_REVIEW_EFFORT || 'medium' }}
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write

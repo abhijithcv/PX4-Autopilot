@@ -1,0 +1,195 @@
+name: Agam AI review (run)
+
+# Runs PX4's AI review (Tools/ci/ai_review from main, unmodified) on one PR
+# and posts the result. Called by agam-pr-checks.yml (automatic, lighter
+# model) and agam-ai-review.yml (the !ai-review command).
+#
+# Differences from PX4's pr-ai-review.yml, all forced by this fork:
+# - GitHub-hosted runners instead of RunsOn.
+# - The Anthropic API instead of Bedrock, through .github/agam/bin/claude.
+#   The key is a secret of the ai-review environment, which only workflows
+#   running from agam-ci may use, so a workflow pushed on another branch
+#   cannot read it.
+# - No sandbox for model-written code, so no gVisor hardening step. The
+#   reviewer keeps PX4's read-only tools (Read, grep, ls, git log/blame/show).
+# - Posting happens here instead of in pr-review-poster.yml.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        type: number
+        required: true
+      model:
+        type: string
+        default: default
+      effort:
+        type: string
+        default: default
+      validator_model:
+        type: string
+        default: ''
+      validator_effort:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  review:
+    name: Review
+    runs-on: ubuntu-latest
+    environment: ai-review
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: agam-ai-review-${{ inputs.pr }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout Agam CI
+        uses: actions/checkout@v6
+        with:
+          path: ci
+          persist-credentials: false
+          sparse-checkout: .github/agam
+
+      # Trusted prompts, criteria and tooling, from main: an upstream
+      # mirror that only maintainers can update in this fork.
+      - name: Checkout PX4 review tooling from main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            AGENTS.md
+            .agents/skills/review-pr
+            .github/instructions
+            .github/workflows/pr-ai-review.yml
+            Tools/ci
+          sparse-checkout-cone-mode: false
+
+      # The PR as data for the reviewer to read. Never built or run.
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          path: pr
+          ref: refs/pull/${{ inputs.pr }}/head
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install the Claude Code version PX4 pins
+        run: |
+          version=$(sed -n 's/^ *CLAUDE_CODE_VERSION: *//p' base/.github/workflows/pr-ai-review.yml | head -1)
+          if [ -z "$version" ]; then
+            echo "::error::CLAUDE_CODE_VERSION not found in PX4's pr-ai-review.yml"
+            exit 1
+          fi
+          npm install -g "@anthropic-ai/claude-code@${version}"
+          echo "REAL_CLAUDE=$(command -v claude)" >> "$GITHUB_ENV"
+          echo "$GITHUB_WORKSPACE/ci/.github/agam/bin" >> "$GITHUB_PATH"
+
+      - name: Run review
+        working-directory: base/Tools/ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PR_NUMBER: ${{ inputs.pr }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+          VALIDATOR_MODEL: ${{ inputs.validator_model }}
+          VALIDATOR_EFFORT: ${{ inputs.validator_effort }}
+        run: |
+          extra=()
+          if [ -n "$VALIDATOR_MODEL" ]; then extra+=(--validator-model "$VALIDATOR_MODEL"); fi
+          if [ -n "$VALIDATOR_EFFORT" ]; then extra+=(--validator-effort "$VALIDATOR_EFFORT"); fi
+          python3 -m ai_review run --pr "$PR_NUMBER" --model "$MODEL" \
+            --effort "$EFFORT" "${extra[@]}" \
+            --trusted-root "$GITHUB_WORKSPACE/base" \
+            --checkout "$GITHUB_WORKSPACE/pr" \
+            --work-dir "$GITHUB_WORKSPACE/ai-review-work" \
+            --out-dir "$GITHUB_WORKSPACE/pr-review"
+
+      # PX4's tool screens its output for the AWS and GitHub credentials it
+      # knows about; this fork's credential is the API key.
+      - name: Screen the output for the API key
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -n "$ANTHROPIC_API_KEY" ] && grep -rqF -- "$ANTHROPIC_API_KEY" \
+              pr-review ai-review-work "$GITHUB_STEP_SUMMARY" 2>/dev/null; then
+            rm -rf pr-review ai-review-work
+            : > "$GITHUB_STEP_SUMMARY"
+            echo "::error::Review output contained the API key; nothing will be posted."
+            exit 1
+          fi
+
+      - name: Upload pr-review artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr-review
+          path: |
+            pr-review/manifest.json
+            pr-review/comments.json
+          if-no-files-found: ignore
+          retention-days: 1
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-review-report
+          path: |
+            ai-review-work/findings.json
+            ai-review-work/report.md
+            ai-review-work/usage.json
+            pr-review/manifest.json
+            pr-review/comments.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+  post:
+    name: Post
+    needs: review
+    if: always() && needs.review.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout PX4 review poster from main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+          sparse-checkout: |
+            Tools/ci/pr-review-poster.py
+            Tools/ci/_github_helpers.py
+          sparse-checkout-cone-mode: false
+
+      - name: Download pr-review artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: pr-review
+          path: pr-review
+
+      - name: Post the review
+        if: steps.download.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 Tools/ci/pr-review-poster.py validate pr-review
+          python3 Tools/ci/pr-review-poster.py post pr-review

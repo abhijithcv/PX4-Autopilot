@@ -1,0 +1,146 @@
+name: Agam AI review
+
+# On-demand AI review of a PR in this fork, with PX4's own command syntax
+# (see Tools/ci/ai_review/README.md on main). Comment on the PR with only:
+#
+#   !ai-review                        PX4's defaults: Opus at xhigh effort
+#   !ai-review effort=medium
+#   !ai-review model=sonnet effort=high
+#
+# Models: opus, sonnet. Efforts: low, medium, high, xhigh, max. A comment
+# that says anything else as well does not trigger.
+#
+# Maintainers only: the commenter needs the maintain or admin role on this
+# repository, which members of the px4-maintainers team have. PX4's
+# trigger.py then parses the command, reacts with 👀, and sets an
+# "AI PR Review" status on the PR head (🚀 or 😕 when done).
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+      model:
+        description: Reviewer model
+        type: choice
+        options: [default, opus, sonnet]
+        default: default
+      effort:
+        description: Reviewer effort
+        type: choice
+        options: [default, low, medium, high, xhigh, max]
+        default: default
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Check trigger and permission
+    if: >-
+      github.event_name == 'workflow_dispatch'
+      || (github.event.issue.pull_request
+          && contains(github.event.comment.body, '!ai-review'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write  # react to the comment
+      statuses: write       # "AI PR Review" status on the PR head
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+      pr: ${{ steps.decide.outputs.pr }}
+      head_sha: ${{ steps.decide.outputs.head_sha }}
+      model: ${{ steps.decide.outputs.model }}
+      effort: ${{ steps.decide.outputs.effort }}
+      comment_id: ${{ steps.decide.outputs.comment_id }}
+    steps:
+      # Checked before PX4's trigger, which would accept any write access
+      # and react to the comment.
+      - name: Maintainers only
+        id: role
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LOGIN: ${{ github.event.comment.user.login || github.actor }}
+        run: |
+          role=$(gh api "repos/${GITHUB_REPOSITORY}/collaborators/${LOGIN}/permission" \
+                 --jq .role_name 2>/dev/null || echo none)
+          echo "${LOGIN} has the ${role} role"
+          case "$role" in
+            admin|maintain) echo "ok=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::notice::!ai-review is for maintainers; ${LOGIN} has the ${role} role." ;;
+          esac
+
+      - name: Checkout PX4 trigger from main
+        if: steps.role.outputs.ok == 'true'
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: base
+          persist-credentials: false
+          sparse-checkout: Tools/ci
+
+      - name: Decide
+        id: decide
+        if: steps.role.outputs.ok == 'true'
+        working-directory: base/Tools/ci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_MODEL: ${{ inputs.model }}
+          INPUT_EFFORT: ${{ inputs.effort }}
+        run: python3 -m ai_review trigger
+
+  review:
+    name: Review PR #${{ needs.gate.outputs.pr }}
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    uses: ./.github/workflows/agam-ai-review-run.yml
+    with:
+      pr: ${{ fromJSON(needs.gate.outputs.pr) }}
+      model: ${{ needs.gate.outputs.model }}
+      effort: ${{ needs.gate.outputs.effort }}
+    secrets: inherit
+    permissions:
+      contents: read
+      pull-requests: write
+
+  finish:
+    name: Report back on the PR
+    needs: [gate, review]
+    if: always() && needs.gate.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+      statuses: write
+    steps:
+      - name: Checkout PX4 tooling from main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          path: base
+          persist-credentials: false
+          sparse-checkout: Tools/ci
+
+      - name: Status
+        working-directory: base/Tools/ci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ needs.gate.outputs.head_sha }}
+          RESULT: ${{ needs.review.result }}
+        run: python3 -m ai_review status "$HEAD_SHA" "$RESULT"
+
+      - name: React
+        if: needs.gate.outputs.comment_id != '0'
+        working-directory: base/Tools/ci
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ needs.gate.outputs.comment_id }}
+          RESULT: ${{ needs.review.result == 'success' && 'rocket' || 'confused' }}
+        run: python3 -m ai_review react "$COMMENT_ID" "$RESULT"
