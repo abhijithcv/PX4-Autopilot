@@ -8,10 +8,10 @@
 #   2. Rulesets: every branch and tag is maintainers only, whatever its name.
 #      Other members work in their own forks and open PRs here.
 #   3. ai-review environment: its secrets reach only workflows on agam-ci.
-#   4. agam-ci becomes the default branch, so pull_request_target and
-#      issue_comment workflows run from it.
-#   5. Upstream workflows that need PX4's own runners or accounts are
+#   4. Upstream workflows that need PX4's own runners or accounts are
 #      disabled; otherwise they sit queued on every PR here.
+#   5. agam-ci becomes the default branch, so pull_request_target and
+#      issue_comment workflows run from it.
 set -euo pipefail
 
 ORG=agam-robotics
@@ -60,10 +60,12 @@ if ! gh api "repos/$REPO/environments/ai-review/deployment-branch-policies" \
 fi
 echo "  deployments allowed from: agam-ci"
 
-echo "== default branch"
-gh api -X PATCH "repos/$REPO" -f default_branch=agam-ci --jq '"  \(.default_branch)"'
-
 echo "== upstream workflows"
+# GitHub lists only the default branch's workflows and can disable only
+# listed ones, so list them with main as the default for a moment. The
+# disabled state survives the switch back, and a re-run catches workflows
+# PX4 adds later.
+gh api -X PATCH "repos/$REPO" -f default_branch=main >/dev/null
 gh api "repos/$REPO/actions/workflows" --paginate \
 	--jq '.workflows[] | select(.state == "active") | "\(.id) \(.path)"' |
 	while read -r id path; do
@@ -73,6 +75,9 @@ gh api "repos/$REPO/actions/workflows" --paginate \
 		*) continue ;;  # GitHub's own dynamic workflows
 		esac
 		case " ${KEEP[*]} " in *" $path "*) continue ;; esac
-		gh api -X PUT "repos/$REPO/actions/workflows/$id/disable"
+		gh api -X PUT "repos/$REPO/actions/workflows/$id/disable" </dev/null
 		echo "  disabled $path"
 	done
+
+echo "== default branch"
+gh api -X PATCH "repos/$REPO" -f default_branch=agam-ci --jq '"  \(.default_branch)"'
