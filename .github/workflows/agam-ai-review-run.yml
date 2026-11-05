@@ -84,6 +84,29 @@ jobs:
           fetch-depth: 0
           filter: blob:none
 
+      # Says what is wrong with a stored credential without printing it.
+      - name: Check the credential
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          token=$(printf '%s' "$CLAUDE_CODE_OAUTH_TOKEN" | tr -d '[:space:]')
+          key=$(printf '%s' "$ANTHROPIC_API_KEY" | tr -d '[:space:]')
+          if [ -n "$token" ]; then
+            case "$token" in
+              sk-ant-oat*) echo "Subscription token: ${#token} characters" ;;
+              *) echo "::warning::CLAUDE_CODE_OAUTH_TOKEN (${#token} characters) does not start with sk-ant-oat. Store only the token that claude setup-token prints." ;;
+            esac
+          elif [ -n "$key" ]; then
+            case "$key" in
+              sk-ant-api*) echo "API key: ${#key} characters" ;;
+              *) echo "::warning::ANTHROPIC_API_KEY (${#key} characters) does not start with sk-ant-api." ;;
+            esac
+          else
+            echo "::error::Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY in the ai-review environment."
+            exit 1
+          fi
+
       - uses: actions/setup-node@v6
         with:
           node-version: 22
