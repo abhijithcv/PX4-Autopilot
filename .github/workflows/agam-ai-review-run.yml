@@ -6,10 +6,12 @@ name: Agam AI review (run)
 #
 # Differences from PX4's pr-ai-review.yml, all forced by this fork:
 # - GitHub-hosted runners instead of RunsOn.
-# - The Anthropic API instead of Bedrock, through .github/agam/bin/claude.
-#   The key is a secret of the ai-review environment, which only workflows
-#   running from agam-ci may use, so a workflow pushed on another branch
-#   cannot read it.
+# - Anthropic instead of Bedrock, through .github/agam/bin/claude: a Claude
+#   subscription token (CLAUDE_CODE_OAUTH_TOKEN, from `claude setup-token`),
+#   which needs --safe-mode in place of PX4's --bare, or an API key. Both
+#   are secrets of the ai-review environment, which only workflows running
+#   from agam-ci may use, so a workflow pushed on another branch cannot
+#   read them.
 # - No sandbox for model-written code, so no gVisor hardening step. The
 #   reviewer keeps PX4's read-only tools (Read, grep, ls, git log/blame/show).
 # - Posting happens here instead of in pr-review-poster.yml.
@@ -86,14 +88,21 @@ jobs:
         with:
           node-version: 22
 
-      - name: Install the Claude Code version PX4 pins
+      # PX4's pinned version, or 2.1.318 if that is newer: the first one
+      # known to have --safe-mode, which subscription auth needs.
+      - name: Install Claude Code
         run: |
-          version=$(sed -n 's/^ *CLAUDE_CODE_VERSION: *//p' base/.github/workflows/pr-ai-review.yml | head -1)
-          if [ -z "$version" ]; then
+          px4=$(sed -n 's/^ *CLAUDE_CODE_VERSION: *//p' base/.github/workflows/pr-ai-review.yml | head -1)
+          if [ -z "$px4" ]; then
             echo "::error::CLAUDE_CODE_VERSION not found in PX4's pr-ai-review.yml"
             exit 1
           fi
+          version=$(printf '%s\n' "$px4" 2.1.318 | sort -V | tail -1)
           npm install -g "@anthropic-ai/claude-code@${version}"
+          if ! claude --help | grep -q -- --safe-mode; then
+            echo "::error::Claude Code ${version} has no --safe-mode"
+            exit 1
+          fi
           echo "REAL_CLAUDE=$(command -v claude)" >> "$GITHUB_ENV"
           echo "$GITHUB_WORKSPACE/ci/.github/agam/bin" >> "$GITHUB_PATH"
 
@@ -101,6 +110,7 @@ jobs:
         working-directory: base/Tools/ci
         env:
           GH_TOKEN: ${{ github.token }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           PR_NUMBER: ${{ inputs.pr }}
           MODEL: ${{ inputs.model }}
@@ -119,19 +129,22 @@ jobs:
             --out-dir "$GITHUB_WORKSPACE/pr-review"
 
       # PX4's tool screens its output for the AWS and GitHub credentials it
-      # knows about; this fork's credential is the API key.
-      - name: Screen the output for the API key
+      # knows about; this fork's credentials are these two.
+      - name: Screen the output for the credentials
         if: always()
         env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -n "$ANTHROPIC_API_KEY" ] && grep -rqF -- "$ANTHROPIC_API_KEY" \
-              pr-review ai-review-work "$GITHUB_STEP_SUMMARY" 2>/dev/null; then
-            rm -rf pr-review ai-review-work
-            : > "$GITHUB_STEP_SUMMARY"
-            echo "::error::Review output contained the API key; nothing will be posted."
-            exit 1
-          fi
+          for secret in "$CLAUDE_CODE_OAUTH_TOKEN" "$ANTHROPIC_API_KEY"; do
+            if [ -n "$secret" ] && grep -rqF -- "$secret" \
+                pr-review ai-review-work "$GITHUB_STEP_SUMMARY" 2>/dev/null; then
+              rm -rf pr-review ai-review-work
+              : > "$GITHUB_STEP_SUMMARY"
+              echo "::error::Review output contained a credential; nothing will be posted."
+              exit 1
+            fi
+          done
 
       - name: Upload pr-review artifact
         if: always()

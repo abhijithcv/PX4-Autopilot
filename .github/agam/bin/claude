@@ -3,13 +3,19 @@
 #
 # That tool only talks to Amazon Bedrock: it sets CLAUDE_CODE_USE_BEDROCK=1
 # and names models by Bedrock profile (global.anthropic.claude-opus-5-5).
-# This fork has an Anthropic API key instead, so drop the Bedrock switch,
-# map each profile to the plain model id, and run the real Claude Code with
-# the arguments unchanged.
+# This fork uses Anthropic's own service instead, so drop the Bedrock switch
+# and map each profile to the plain model id.
+#
+# Auth, first match wins:
+# - CLAUDE_CODE_OAUTH_TOKEN (a Claude subscription, from `claude setup-token`):
+#   PX4 runs Claude Code with --bare, which accepts only API keys, so swap it
+#   for --safe-mode. That disables the same things a PR could otherwise
+#   bring in (CLAUDE.md, skills, hooks, plugins, MCP servers) but keeps the
+#   normal login. PX4's other flags (--restricted, its tool allowlist) stay.
+# - ANTHROPIC_API_KEY: arguments unchanged.
 set -euo pipefail
 
 : "${REAL_CLAUDE:?REAL_CLAUDE must point at the installed claude binary}"
-: "${ANTHROPIC_API_KEY:?ANTHROPIC_API_KEY is not set}"
 
 unset CLAUDE_CODE_USE_BEDROCK
 for var in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
@@ -18,4 +24,20 @@ for var in ANTHROPIC_MODEL ANTHROPIC_DEFAULT_HAIKU_MODEL; do
 	fi
 done
 
-exec "$REAL_CLAUDE" "$@"
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+	unset ANTHROPIC_API_KEY
+	args=()
+	for arg in "$@"; do
+		if [ "$arg" = --bare ]; then
+			args+=(--safe-mode)
+		else
+			args+=("$arg")
+		fi
+	done
+	exec "$REAL_CLAUDE" "${args[@]}"
+elif [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+	exec "$REAL_CLAUDE" "$@"
+else
+	echo "error: set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY" >&2
+	exit 1
+fi

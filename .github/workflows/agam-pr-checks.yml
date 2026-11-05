@@ -7,7 +7,7 @@ name: Agam PR checks
 #   lint       hygiene, commit messages, Agam board IDs (.github/agam/pr_checks.py)
 #   px4-gate   the gate checks of PX4's checks.yml (check_format and others)
 #   build      the boards the PR touches, else SITL and fmu-v6x for source changes
-#   ai-review  PX4's AI review at medium effort, the same as `!ai-review effort=medium`
+#   ai-review  PX4's AI review, Sonnet at medium effort (reviewer and validator)
 #
 # Runs only when the person who opened or pushed has write access or more,
 # so PRs from strangers' forks spend nothing. pull_request_target always
@@ -18,8 +18,9 @@ name: Agam PR checks
 #
 # Repository variables (Settings > Secrets and variables > Variables):
 #   AGAM_AUTO_REVIEW         off to skip the automatic AI review
-#   AGAM_AUTO_REVIEW_MODEL   default: PX4's default model (Opus)
-#   AGAM_AUTO_REVIEW_EFFORT  default: medium
+#   AGAM_AUTO_REVIEW_MODEL   default sonnet (reviews count against the Claude
+#                            subscription's limits)
+#   AGAM_AUTO_REVIEW_EFFORT  default medium
 
 on:
   pull_request_target:
@@ -234,8 +235,10 @@ jobs:
     uses: ./.github/workflows/agam-ai-review-run.yml
     with:
       pr: ${{ github.event.pull_request.number }}
-      model: ${{ vars.AGAM_AUTO_REVIEW_MODEL || 'default' }}
+      model: ${{ vars.AGAM_AUTO_REVIEW_MODEL || 'sonnet' }}
       effort: ${{ vars.AGAM_AUTO_REVIEW_EFFORT || 'medium' }}
+      validator_model: ${{ vars.AGAM_AUTO_REVIEW_MODEL || 'sonnet' }}
+      validator_effort: ${{ vars.AGAM_AUTO_REVIEW_EFFORT || 'medium' }}
     secrets: inherit
     permissions:
       contents: read
